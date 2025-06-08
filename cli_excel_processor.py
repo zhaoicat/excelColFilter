@@ -10,6 +10,7 @@ import pandas as pd
 import sys
 import os
 import requests
+import time
 from openpyxl.drawing import image as xl_image
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -124,102 +125,106 @@ def get_columns_from_input(input_string, available_columns):
     return result
 
 
-def convert_webp_to_jpg(webp_path):
-    """将webp格式图片转换为jpg格式以支持Excel显示"""
+def convert_to_bmp_in_memory(image_path):
+    """在内存中将任意格式图片转换为BMP格式的临时文件用于Excel显示"""
     if not PIL_AVAILABLE:
-        return None
+        return image_path  # 如果PIL不可用，返回原路径
         
     try:
-        jpg_path = webp_path.replace('.webp', '_converted.jpg')
-        # 如果转换后的文件已存在，直接返回
-        if os.path.exists(jpg_path):
-            return jpg_path
-            
-        with Image.open(webp_path) as img:
-            # 转换为RGB模式（去除透明通道）
+        import tempfile
+        
+        with Image.open(image_path) as img:
+            # 转换为RGB模式（BMP不支持透明通道）
             if img.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 if img.mode == 'P':
                     img = img.convert('RGBA')
-                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                if img.mode == 'RGBA':
+                    background.paste(img, mask=img.split()[-1])
+                else:
+                    background.paste(img)
                 img = background
             else:
                 img = img.convert('RGB')
-            img.save(jpg_path, 'JPEG', quality=90)
-        
-        # 验证转换后的文件存在
-        if os.path.exists(jpg_path):
-            return jpg_path
-        else:
-            return None
+            
+            # 创建临时BMP文件
+            temp_file = tempfile.NamedTemporaryFile(suffix='.bmp', delete=False)
+            temp_path = temp_file.name
+            temp_file.close()
+            
+            # 保存为BMP格式到临时文件
+            img.save(temp_path, 'BMP')
+            
+            return temp_path
     except Exception as e:
-        print(f"webp转换失败: {e}")
-        return None
+        print(f"图片内存转换BMP失败 {image_path}: {e}")
+        return image_path  # 转换失败，返回原路径
 
 
-def download_single_image(url, output_dir="images", timeout=30):
-    """下载单个图片（保持原图）"""
-    try:
-        # 验证URL
-        if not url or pd.isna(url) or not str(url).startswith(('http://', 'https://')):
-            return None, url
-        
-        # 创建图片目录
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # 生成文件名（使用URL的hash值避免重复和特殊字符）
-        url_hash = hashlib.md5(str(url).encode()).hexdigest()
-        
-        # 尝试从URL获取文件扩展名
-        parsed_url = urlparse(str(url))
-        path = parsed_url.path.lower()
-        if path.endswith(('.jpg', '.jpeg')):
-            ext = '.jpg'
-        elif path.endswith('.png'):
-            ext = '.png'
-        elif path.endswith('.gif'):
-            ext = '.gif'
-        elif path.endswith('.webp'):
-            ext = '.webp'
-        else:
-            ext = '.jpg'  # 默认使用jpg
-        
-        filename = f"{url_hash}{ext}"
-        filepath = os.path.join(output_dir, filename)
-        
-        # 如果文件已存在，直接返回
-        if os.path.exists(filepath):
-            return filepath, url
-        
-        # 下载图片
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(str(url), headers=headers, timeout=timeout, stream=True)
-        response.raise_for_status()
-        
-        # 保存图片
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        # 检查是否为webp格式，如果是则转换为jpg
-        try:
-            if PIL_AVAILABLE:
-                with Image.open(filepath) as img:
-                    if img.format == 'WEBP':
-                        jpg_filepath = convert_webp_to_jpg(filepath)
-                        if jpg_filepath and os.path.exists(jpg_filepath):
-                            # 删除原webp文件
-                            os.remove(filepath)
-                            filepath = jpg_filepath
-        except Exception:
-            pass  # 如果转换失败，继续使用原文件
-        
-        return filepath, url
-        
-    except Exception:
+def download_single_image(url, output_dir="images", timeout=30, max_retries=3):
+    """下载单个图片（保持原图），支持重试"""
+    # 验证URL
+    if not url or pd.isna(url) or not str(url).startswith(('http://', 'https://')):
         return None, url
+    
+    # 创建图片目录
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 生成文件名（使用URL的hash值避免重复和特殊字符）
+    url_hash = hashlib.md5(str(url).encode()).hexdigest()
+    
+    # 尝试从URL获取文件扩展名
+    parsed_url = urlparse(str(url))
+    path = parsed_url.path.lower()
+    if path.endswith(('.jpg', '.jpeg')):
+        ext = '.jpg'
+    elif path.endswith('.png'):
+        ext = '.png'
+    elif path.endswith('.gif'):
+        ext = '.gif'
+    elif path.endswith('.webp'):
+        ext = '.webp'
+    else:
+        ext = '.jpg'  # 默认使用jpg
+    
+    filename = f"{url_hash}{ext}"
+    filepath = os.path.join(output_dir, filename)
+    
+    # 如果文件已存在，直接返回
+    if os.path.exists(filepath):
+        return filepath, url
+    
+    # 重试下载
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            # 下载图片
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(str(url), headers=headers, timeout=timeout, stream=True)
+            response.raise_for_status()
+            
+            # 保存图片
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            # 验证文件是否成功保存
+            if os.path.exists(filepath):
+                return filepath, url
+            else:
+                raise Exception("文件保存后不存在")
+                
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:  # 如果不是最后一次尝试
+                print(f"下载失败，第{attempt + 1}次重试: {url}")
+                time.sleep(1)  # 等待1秒后重试
+            continue
+    
+    print(f"下载最终失败 (重试{max_retries}次): {url}, 错误: {last_error}")
+    return None, url
 
 
 def download_images_parallel(urls, max_workers=5, output_dir="images"):
@@ -244,10 +249,12 @@ def download_images_parallel(urls, max_workers=5, output_dir="images"):
             url = future_to_url[future]
             try:
                 filepath, original_url = future.result()
-                if filepath:
+                if filepath and os.path.exists(filepath):
                     results[original_url] = filepath
                 else:
                     failed_urls.append(original_url)
+                    if filepath:
+                        print(f"下载的文件不存在: {filepath}")
             except Exception as e:
                 print(f"下载异常 {url}: {e}")
                 failed_urls.append(url)
@@ -309,11 +316,22 @@ def export_columns(df, selected_columns, output_file, download_images=False):
             if download_images and image_column:
                 # 收集所有图片URL
                 image_urls = []
+                empty_urls = 0
+                duplicate_urls = set()
                 for _, row in result_df.iterrows():
                     url = row[image_column]
                     if pd.notna(url) and str(url).strip():
-                        image_urls.append(str(url))
+                        url_str = str(url)
+                        if url_str in duplicate_urls:
+                            continue  # 跳过重复URL
+                        duplicate_urls.add(url_str)
+                        image_urls.append(url_str)
+                    else:
+                        empty_urls += 1
                 
+                print(f"URL统计: 总行数={len(result_df)}, 有效URL={len(image_urls)}, 空URL={empty_urls}, 重复URL={len(result_df)-len(image_urls)-empty_urls}")
+                
+                temp_files_to_cleanup = []  # 初始化临时文件列表
                 if image_urls:
                     # 并行下载所有图片
                     image_results = download_images_parallel(image_urls, max_workers=8)
@@ -345,8 +363,18 @@ def export_columns(df, selected_columns, output_file, download_images=False):
                                         print(f"文件不存在，跳过: {image_path}")
                                         continue
                                     
+                                    # 统一转换图片格式为BMP以兼容Excel
+                                    final_image_path = convert_to_bmp_in_memory(image_path)
+                                    if not final_image_path:
+                                        print(f"图片格式转换失败，跳过: {image_path}")
+                                        continue
+                                    
+                                    # 如果是新生成的临时文件，记录以便后续清理
+                                    if final_image_path != image_path:
+                                        temp_files_to_cleanup.append(final_image_path)
+                                    
                                     # 插入图片到Excel
-                                    img = xl_image.Image(image_path)
+                                    img = xl_image.Image(final_image_path)
                                     
                                     # 获取原图尺寸并保持比例缩放显示
                                     original_width = img.width
@@ -391,6 +419,14 @@ def export_columns(df, selected_columns, output_file, download_images=False):
         
         if download_images and image_column:
             print(f"图片处理: 从 {image_column} 列处理了图片并保存到 images/ 目录")
+        
+        # Excel保存完成后清理临时文件
+        if 'temp_files_to_cleanup' in locals():
+            for temp_file in temp_files_to_cleanup:
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass  # 忽略清理失败
         
         return True
     
