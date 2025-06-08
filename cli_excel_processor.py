@@ -15,6 +15,12 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
 
 def read_excel_file(file_path):
     """读取Excel文件"""
@@ -118,6 +124,39 @@ def get_columns_from_input(input_string, available_columns):
     return result
 
 
+def convert_webp_to_jpg(webp_path):
+    """将webp格式图片转换为jpg格式以支持Excel显示"""
+    if not PIL_AVAILABLE:
+        return None
+        
+    try:
+        jpg_path = webp_path.replace('.webp', '_converted.jpg')
+        # 如果转换后的文件已存在，直接返回
+        if os.path.exists(jpg_path):
+            return jpg_path
+            
+        with Image.open(webp_path) as img:
+            # 转换为RGB模式（去除透明通道）
+            if img.mode in ('RGBA', 'LA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = background
+            else:
+                img = img.convert('RGB')
+            img.save(jpg_path, 'JPEG', quality=90)
+        
+        # 验证转换后的文件存在
+        if os.path.exists(jpg_path):
+            return jpg_path
+        else:
+            return None
+    except Exception as e:
+        print(f"webp转换失败: {e}")
+        return None
+
+
 def download_single_image(url, output_dir="images", timeout=30):
     """下载单个图片（保持原图）"""
     try:
@@ -159,10 +198,23 @@ def download_single_image(url, output_dir="images", timeout=30):
         response = requests.get(str(url), headers=headers, timeout=timeout, stream=True)
         response.raise_for_status()
         
-        # 直接保存原图
+        # 保存图片
         with open(filepath, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
+        
+        # 检查是否为webp格式，如果是则转换为jpg
+        try:
+            if PIL_AVAILABLE:
+                with Image.open(filepath) as img:
+                    if img.format == 'WEBP':
+                        jpg_filepath = convert_webp_to_jpg(filepath)
+                        if jpg_filepath and os.path.exists(jpg_filepath):
+                            # 删除原webp文件
+                            os.remove(filepath)
+                            filepath = jpg_filepath
+        except Exception:
+            pass  # 如果转换失败，继续使用原文件
         
         return filepath, url
         
@@ -218,15 +270,22 @@ def export_columns(df, selected_columns, output_file, download_images=False):
             print("错误: 没有有效的列可以导出")
             return False
         
-        result_df = df[selected_columns].copy()
-        
         # 检查是否有商品图片列且需要下载图片
         image_column = None
         if download_images:
-            for col in ['商品图片', '图片', '商品图片链接']:
-                if col in result_df.columns:
-                    image_column = col
-                    break
+            if '商品图片' in selected_columns:
+                image_column = '商品图片'
+        
+        # 如果有图片列且要下载图片，调整列顺序，将图片列放在第一列
+        if download_images and image_column:
+            # 将图片列移到第一列
+            reordered_columns = [image_column]
+            for col in selected_columns:
+                if col != image_column:
+                    reordered_columns.append(col)
+            selected_columns = reordered_columns
+        
+        result_df = df[selected_columns].copy()
         
         # 使用ExcelWriter来控制格式
         with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
@@ -259,55 +318,68 @@ def export_columns(df, selected_columns, output_file, download_images=False):
                     # 并行下载所有图片
                     image_results = download_images_parallel(image_urls, max_workers=8)
                     
-                    # 添加图片预览列
-                    preview_col = len(result_df.columns) + 1
-                    worksheet.cell(row=1, column=preview_col, value='图片预览')
+                    # 找到图片列的位置（现在应该在第一列）
+                    image_col_idx = None
+                    for col_idx, col_name in enumerate(result_df.columns, 1):
+                        if col_name == image_column:
+                            image_col_idx = col_idx
+                            break
                     
-                    # 设置列宽
-                    col_letter = worksheet.cell(row=1, column=preview_col).column_letter
-                    worksheet.column_dimensions[col_letter].width = 15
-                    
-                    inserted_count = 0
-                    
-                    # 插入图片到Excel
-                    for row_idx, (_, row) in enumerate(result_df.iterrows(), 2):
-                        image_url = str(row[image_column]) if pd.notna(row[image_column]) else ""
+                    if image_col_idx:
+                        # 设置图片列宽
+                        col_letter = worksheet.cell(row=1, column=image_col_idx).column_letter
+                        worksheet.column_dimensions[col_letter].width = 15
                         
-                        if image_url in image_results:
-                            image_path = image_results[image_url]
+                        inserted_count = 0
+                        
+                        # 插入图片到Excel
+                        for row_idx, (_, row) in enumerate(result_df.iterrows(), 2):
+                            image_url = str(row[image_column]) if pd.notna(row[image_column]) else ""
                             
-                            try:
-                                # 插入图片到Excel
-                                img = xl_image.Image(image_path)
+                            if image_url in image_results:
+                                image_path = image_results[image_url]
                                 
-                                # 获取原图尺寸并保持比例缩放显示
-                                original_width = img.width
-                                original_height = img.height
-                                max_display_size = 100
-                                
-                                if original_width > max_display_size or original_height > max_display_size:
-                                    if original_width > original_height:
-                                        img.width = max_display_size
-                                        img.height = int(original_height * max_display_size / original_width)
-                                    else:
-                                        img.height = max_display_size
-                                        img.width = int(original_width * max_display_size / original_height)
-                                
-                                # 设置图片位置
-                                cell_ref = worksheet.cell(row=row_idx, column=preview_col).coordinate
-                                img.anchor = cell_ref
-                                
-                                worksheet.add_image(img)
-                                
-                                # 设置行高以适应图片
-                                worksheet.row_dimensions[row_idx].height = 80
-                                
-                                inserted_count += 1
-                                
-                            except Exception as e:
-                                print(f"插入图片失败 {image_url}: {e}")
-                    
-                    print(f"成功插入 {inserted_count} 张图片到Excel")
+                                try:
+                                    # 确保文件存在
+                                    if not os.path.exists(image_path):
+                                        print(f"文件不存在，跳过: {image_path}")
+                                        continue
+                                    
+                                    # 插入图片到Excel
+                                    img = xl_image.Image(image_path)
+                                    
+                                    # 获取原图尺寸并保持比例缩放显示
+                                    original_width = img.width
+                                    original_height = img.height
+                                    max_display_size = 100
+                                    
+                                    if original_width > max_display_size or original_height > max_display_size:
+                                        if original_width > original_height:
+                                            img.width = max_display_size
+                                            img.height = int(original_height * max_display_size / original_width)
+                                        else:
+                                            img.height = max_display_size
+                                            img.width = int(original_width * max_display_size / original_height)
+                                    
+                                    # 设置图片位置
+                                    cell_ref = worksheet.cell(row=row_idx, column=image_col_idx).coordinate
+                                    img.anchor = cell_ref
+                                    
+                                    worksheet.add_image(img)
+                                    
+                                    # 清空单元格中的URL文字，只保留图片
+                                    cell = worksheet.cell(row=row_idx, column=image_col_idx)
+                                    cell.value = ""
+                                    
+                                    # 设置行高以适应图片
+                                    worksheet.row_dimensions[row_idx].height = 80
+                                    
+                                    inserted_count += 1
+                                    
+                                except Exception as e:
+                                    print(f"插入图片失败 {image_url}: {e}")
+                        
+                        print(f"成功插入 {inserted_count} 张图片到Excel")
                 else:
                     print("没有找到有效的图片URL")
         
@@ -323,7 +395,9 @@ def export_columns(df, selected_columns, output_file, download_images=False):
         return True
     
     except Exception as e:
+        import traceback
         print(f"导出失败: {e}")
+        print(f"详细错误信息:\n{traceback.format_exc()}")
         return False
 
 
